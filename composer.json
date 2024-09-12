@@ -1,0 +1,52 @@
+{
+    "name": "reachweb/resrv-payment-mollie",
+    "description": "Mollie payment gateway for Statamic Resrv.",
+    "keywords": [
+        "Statamic",
+        "Resrv"
+    ],
+    "homepage": "https://resrv.eu/",
+    "license": "mit",
+    "type": "statamic-addon",
+    "authors": [
+        {
+            "name": "Iosif Chatzimichail",
+            "email": "iosif@reach.gr",
+            "role": "Developer"
+        }
+    ],
+    "support": {
+        "email": "info@reach.gr"
+    },
+    "autoload": {
+        "psr-4": {
+            "Reach\\StatamicResrv\\": "src"
+        }
+    },
+    "require": {
+        "statamic/cms": "^5.0",
+        "mollie/laravel-mollie": "^3.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0",
+        "laravel/pint": "^1.17"
+    },
+    "config": {
+        "allow-plugins": {
+            "pixelfear/composer-dist-plugin": true
+        }
+    },
+    "extra": {
+        "statamic": {
+            "name": "Resrv Payment Mollie",
+            "description": "Mollie payment gateway for Statamic Resrv."
+        },
+        "laravel": {
+            "providers": [
+                "Reach\\StatamicResrv\\ServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
