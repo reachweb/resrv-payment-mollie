@@ -1,6 +1,6 @@
 <?php
 
-namespace Reach\StatamicResrv;
+namespace Reach\ResrvPaymentMollie;
 
 use Statamic\Providers\AddonServiceProvider;
 

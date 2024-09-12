@@ -20,11 +20,12 @@
     },
     "autoload": {
         "psr-4": {
-            "Reach\\StatamicResrv\\": "src"
+            "Reach\\ResrvPaymentMollie\\": "src"
         }
     },
     "require": {
         "statamic/cms": "^5.0",
+        "reachweb/statamic-resrv": "^3.0 || dev-main",
         "mollie/laravel-mollie": "^3.0"
     },
     "require-dev": {
@@ -43,7 +44,7 @@
         },
         "laravel": {
             "providers": [
-                "Reach\\StatamicResrv\\ServiceProvider"
+                "Reach\\ResrvPaymentMollie\\ServiceProvider"
             ]
         }
     },

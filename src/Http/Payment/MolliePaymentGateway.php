@@ -1,12 +1,13 @@
 <?php
 
-namespace Reach\StatamicResrv\Http\Payment;
+namespace Reach\ResrvPaymentMollie\Http\Payment;
 
 use Illuminate\Support\Facades\Log;
 use Mollie\Laravel\Facades\Mollie;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationCancelled;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
+use Reach\StatamicResrv\Http\Payment\PaymentInterface;
 use Reach\StatamicResrv\Livewire\Traits\HandlesStatamicQueries;
 use Reach\StatamicResrv\Models\Reservation;
 
