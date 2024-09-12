@@ -7,6 +7,7 @@ use Mollie\Laravel\Facades\Mollie;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationCancelled;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
+use Reach\StatamicResrv\Exceptions\RefundFailedException;
 use Reach\StatamicResrv\Http\Payment\PaymentInterface;
 use Reach\StatamicResrv\Livewire\Traits\HandlesStatamicQueries;
 use Reach\StatamicResrv\Models\Reservation;
@@ -23,7 +24,7 @@ class MolliePaymentGateway implements PaymentInterface
                 'value' => $payment->format(),
             ],
             'description' => $reservation->entry()->title,
-            'redirectUrl' => $this->getCheckoutCompleteEntry()->absoluteUrl(),
+            'redirectUrl' => $this->getCheckoutCompleteEntry()->absoluteUrl().'?id='.$reservation->id,
             'webhookUrl' => route('resrv.webhook.store'),
             'metadata' => [
                 'order_id' => $reservation->id,
@@ -40,7 +41,24 @@ class MolliePaymentGateway implements PaymentInterface
 
     public function refund($reservation)
     {
-        //
+        $payment = Mollie::api()->payments->get($reservation->payment_id);
+
+        try {
+            if ($payment->canBeRefunded()) {
+                $refund = $payment->refund([
+                    'amount' => [
+                        'currency' => config('resrv-config.currency_isoCode'),
+                        'value' => $reservation->payment->format(),
+                    ],
+                ]);
+            } else {
+                throw new RefundFailedException('This payment could not be refunded.');
+            }
+        } catch (\Mollie\Api\Exceptions\ApiException $exception) {
+            throw new RefundFailedException($exception->getMessage());
+        }
+
+        return $refund;
     }
 
     public function getPublicKey($reservation) {}
@@ -57,15 +75,18 @@ class MolliePaymentGateway implements PaymentInterface
 
     public function handleRedirectBack(): array
     {
-        if ($pending = $this->handlePaymentPending()) {
-            return $pending;
+        $id = request()->input('id');
+
+        $reservation = Reservation::findOrFail($id);
+
+        $payment = Mollie::api()->payments->get($reservation->payment_id);
+
+        if ($payment->status === 'pending') {
+            return [
+                'status' => 'pending',
+                'reservation' => $reservation ? $reservation->toArray() : [],
+            ];
         }
-
-        $paymentIntent = request()->input('id');
-
-        $reservation = Reservation::findByPaymentId($paymentIntent)->first();
-
-        $payment = Mollie::api()->payments->get($paymentIntent);
 
         if ($payment->isPaid()) {
             return [
@@ -82,16 +103,7 @@ class MolliePaymentGateway implements PaymentInterface
 
     public function handlePaymentPending(): bool|array
     {
-        if (! request()->has('payment_pending')) {
-            return false;
-        }
-
-        $reservation = Reservation::find(request()->input('payment_pending'));
-
-        return [
-            'status' => 'pending',
-            'reservation' => $reservation ? $reservation->toArray() : [],
-        ];
+        return false;
     }
 
     public function verifyPayment($request)
