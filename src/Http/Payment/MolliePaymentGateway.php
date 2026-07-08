@@ -55,7 +55,7 @@ class MolliePaymentGateway implements PaymentInterface
         return true;
     }
 
-    public function paymentIntent($payment, Reservation $reservation, $data)
+    public function paymentIntent($payment, Reservation $reservation, $data, ?string $returnUrl = null)
     {
         $molliePayment = Mollie::api()->payments->create([
             'amount' => [
@@ -65,7 +65,10 @@ class MolliePaymentGateway implements PaymentInterface
                 'value' => $payment->format(),
             ],
             'description' => $this->paymentDescription($reservation),
-            'redirectUrl' => $this->redirectBackUrl($reservation),
+            // $returnUrl lets non-checkout surfaces (the manual-reservation pay-by-link page)
+            // send the customer back to their own page; null falls back to the checkout-complete
+            // entry, so normal checkout is unchanged. See UPGRADE-PAYMENT-GATEWAYS.md Step 12.
+            'redirectUrl' => $this->redirectBackUrl($reservation, $returnUrl),
             'webhookUrl' => route('resrv.webhook.gateway.store', ['gateway' => $this->configKey()]),
             'metadata' => [
                 // Critical for the stale-intent fallback in verifyPayment(): payment_id is
@@ -83,6 +86,57 @@ class MolliePaymentGateway implements PaymentInterface
         return $paymentIntent;
     }
 
+    /**
+     * Fetch a previously created payment so the pay-by-link page can resume it instead of
+     * minting (and risking double-charging) a second one. Returns null only when the payment
+     * is definitely gone (404) — the caller then creates a fresh intent. Every transient
+     * failure (timeout, 429, 5xx, auth) propagates so a brownout on this read can never
+     * orphan a still-payable Mollie payment behind a replacement.
+     *
+     * The returned object mirrors the intent shape the resume flow reads: a Stripe-style
+     * ->status (see normalizeIntentStatus) plus ->redirectTo (the hosted checkout URL) so a
+     * resumable payment can send the customer back to Mollie.
+     */
+    public function retrievePaymentIntent(string $paymentId, Reservation $reservation): ?object
+    {
+        try {
+            $payment = Mollie::api()->payments->get($paymentId);
+        } catch (ApiException $e) {
+            if ($e->getStatusCode() === 404) {
+                return null;
+            }
+
+            throw $e;
+        }
+
+        $intent = new \stdClass;
+        $intent->id = $payment->id;
+        $intent->status = $this->normalizeIntentStatus($payment->status);
+        $intent->client_secret = '';
+        // A resumable payment that Mollie no longer exposes a checkout URL for is NOT "gone" —
+        // returning null here would let Resrv mint a replacement without voiding this one,
+        // leaving it payable at Mollie. Reporting it with redirectTo = null makes Resrv void
+        // it first and then mint the replacement (see resumedIntentIsMountable in core).
+        $intent->redirectTo = $payment->getCheckoutUrl();
+
+        return $intent;
+    }
+
+    /**
+     * Map Mollie's payment status onto the Stripe-style vocabulary HandlesDirectGatewayPayment
+     * understands: 'succeeded'/'processing' mean money is already moving (don't remint),
+     * 'canceled' means dead (remint), anything else (i.e. 'open') is resumable.
+     */
+    protected function normalizeIntentStatus(string $status): string
+    {
+        return match ($status) {
+            'paid' => 'succeeded',
+            'pending', 'authorized' => 'processing',
+            'canceled', 'expired', 'failed' => 'canceled',
+            default => $status, // 'open' — resumable via the hosted checkout URL
+        };
+    }
+
     public function cancelPaymentIntent(string $paymentId, Reservation $reservation): void
     {
         try {
@@ -94,7 +148,7 @@ class MolliePaymentGateway implements PaymentInterface
             if ($payment->isCancelable) {
                 Mollie::api()->payments->cancel($paymentId);
             }
-        } catch (ApiException|MollieException $e) {
+        } catch (MollieException $e) {
             Log::warning('Failed to cancel Mollie payment: '.$e->getMessage(), [
                 'payment_id' => $paymentId,
                 'reservation_id' => $reservation->id,
@@ -134,7 +188,7 @@ class MolliePaymentGateway implements PaymentInterface
                     'value' => $payment->amount->value,
                 ],
             ]);
-        } catch (ApiException|MollieException $exception) {
+        } catch (MollieException $exception) {
             // Every Mollie failure mode (invalid request, connection, auth, rate limit) must
             // surface as RefundFailedException so callers roll back the REFUNDED transition
             // and show their refund-failed message instead of a 500.
@@ -164,7 +218,7 @@ class MolliePaymentGateway implements PaymentInterface
 
         try {
             $payment = Mollie::api()->payments->get($reservation->payment_id);
-        } catch (ApiException|MollieException $e) {
+        } catch (MollieException $e) {
             Log::warning('Mollie redirect back: unable to fetch payment: '.$e->getMessage(), [
                 'payment_id' => $reservation->payment_id,
                 'reservation_id' => $reservation->id,
@@ -223,7 +277,7 @@ class MolliePaymentGateway implements PaymentInterface
         // comes from fetching the payment from the API; everything below acts on that.
         try {
             $payment = Mollie::api()->payments->get($paymentId);
-        } catch (ApiException|MollieException $e) {
+        } catch (MollieException $e) {
             Log::warning('Mollie webhook: unable to fetch payment: '.$e->getMessage(), [
                 'payment_id' => $paymentId,
             ]);
@@ -391,11 +445,18 @@ class MolliePaymentGateway implements PaymentInterface
         return $this->name();
     }
 
-    protected function redirectBackUrl(Reservation $reservation): string
+    protected function redirectBackUrl(Reservation $reservation, ?string $returnUrl = null): string
     {
-        // resrv_gateway lets the {{ resrv_checkout_redirect }} tag resolve this gateway even
-        // when the session is unavailable on the way back from Mollie.
-        return $this->getCheckoutCompleteEntry()->absoluteUrl().'?'.http_build_query([
+        // Honour the caller's base (e.g. the authenticated pay-by-link page); fall back to the
+        // checkout-complete entry so normal checkout is byte-identical (Step 12).
+        $base = $returnUrl ?? $this->getCheckoutCompleteEntry()->absoluteUrl();
+
+        // The pay-by-link base already carries ?ref=&hash=, so pick the separator dynamically
+        // rather than hard-coding '?'. resrv_gateway lets the redirect-back handler resolve this
+        // gateway even when the session is unavailable on the way back from Mollie.
+        $separator = str_contains($base, '?') ? '&' : '?';
+
+        return $base.$separator.http_build_query([
             'id' => $reservation->id,
             'resrv_gateway' => $this->configKey(),
         ]);

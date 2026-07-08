@@ -23,11 +23,16 @@
             "Reach\\ResrvPaymentMollie\\": "src"
         }
     },
+    "autoload-dev": {
+        "psr-4": {
+            "Reach\\ResrvPaymentMollie\\Tests\\": "tests"
+        }
+    },
     "require": {
         "php": "^8.4",
         "statamic/cms": "^6.0",
         "reachweb/statamic-resrv": "^6.0",
-        "mollie/laravel-mollie": "^3.1 || ^4.1"
+        "mollie/laravel-mollie": "^4.1"
     },
     "require-dev": {
         "orchestra/testbench": "^10.0 || ^11.0",
