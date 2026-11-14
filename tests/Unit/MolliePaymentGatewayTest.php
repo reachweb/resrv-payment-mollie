@@ -4,6 +4,7 @@ namespace Reach\ResrvPaymentMollie\Tests\Unit;
 
 use Mockery;
 use Mollie\Api\Exceptions\ApiException;
+use Mollie\Api\MollieApiClient;
 use Mollie\Api\Resources\Payment;
 use Mollie\Laravel\Facades\Mollie;
 use PHPUnit\Framework\Attributes\Test;
@@ -23,18 +24,13 @@ class MolliePaymentGatewayTest extends TestCase
 
         $this->payments = Mockery::mock();
 
-        // Mollie::api() returns the API client whose ->payments endpoint the gateway uses;
-        // a plain stub is enough since the gateway never type-checks the client.
-        $client = new class
+        // Mollie::api() returns the facade root and declares MollieApiClient as its return type,
+        // so the stub has to be one. Its real $payments property takes precedence over the
+        // client's magic endpoint lookup; the parent constructor (HTTP adapter) is never needed.
+        $client = new class($this->payments) extends MollieApiClient
         {
-            public $payments;
-
-            public function api()
-            {
-                return $this;
-            }
+            public function __construct(public $payments) {}
         };
-        $client->payments = $this->payments;
 
         Mollie::swap($client);
 
