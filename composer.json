@@ -31,7 +31,7 @@
     "require": {
         "php": "^8.4",
         "statamic/cms": "^6.0",
-        "reachweb/statamic-resrv": "^6.0",
+        "reachweb/statamic-resrv": "^6.5",
         "mollie/laravel-mollie": "^4.1"
     },
     "require-dev": {

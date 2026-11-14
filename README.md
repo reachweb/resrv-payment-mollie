@@ -4,7 +4,7 @@ This add-on adds a [Mollie](https://www.mollie.com) payment gateway to [Statamic
 
 ## Requirements
 
-- Statamic 6 and Statamic Resrv 6
+- Statamic 6 and Statamic Resrv 6.5 or later
 - A Mollie account and API key
 
 > For Resrv 5 or earlier, use [v1.0.0](https://github.com/reachweb/resrv-payment-mollie/releases/tag/v1.0.0) of this add-on.
