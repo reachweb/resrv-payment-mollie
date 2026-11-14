@@ -2,10 +2,14 @@
 
 namespace Reach\ResrvPaymentMollie\Http\Payment;
 
+use Composer\CaBundle\CaBundle;
+use GuzzleHttp\Client;
+use GuzzleHttp\RequestOptions;
 use Illuminate\Support\Facades\Log;
 use Mollie\Api\Exceptions\ApiException;
 use Mollie\Api\Exceptions\MollieException;
-use Mollie\Laravel\Facades\Mollie;
+use Mollie\Api\Http\LinearRetryStrategy;
+use Mollie\Api\MollieApiClient;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
@@ -55,9 +59,34 @@ class MolliePaymentGateway implements PaymentInterface
         return true;
     }
 
+    /**
+     * Every Mollie call goes through a fresh client with short timeouts and no automatic retries.
+     * refund() runs inside the REFUNDED transition's row lock, and mollie-api-php's defaults
+     * (5 retries with growing sleeps, on top of a 30 s HTTP timeout through laravel-mollie) could
+     * hold that lock for minutes. A fresh client per call also keeps a per-request idempotency
+     * key from outliving the request it was set for. Mirrors StripePaymentGateway::getClient().
+     */
+    protected function client(?Reservation $reservation = null): MollieApiClient
+    {
+        $client = new MollieApiClient(app(Client::class, ['config' => [
+            RequestOptions::VERIFY => CaBundle::getBundledCaBundlePath(),
+            RequestOptions::TIMEOUT => 15,
+            RequestOptions::CONNECT_TIMEOUT => 5,
+            RequestOptions::HTTP_ERRORS => false,
+        ]]));
+
+        $client->setRetryStrategy(new LinearRetryStrategy(0, 0));
+
+        if ($key = $this->getSecretKey($reservation)) {
+            $client->setToken($key);
+        }
+
+        return $client;
+    }
+
     public function paymentIntent($payment, Reservation $reservation, $data, ?string $returnUrl = null)
     {
-        $molliePayment = Mollie::api()->payments->create([
+        $molliePayment = $this->client($reservation)->payments->create([
             'amount' => [
                 'currency' => config('resrv-config.currency_isoCode'),
                 // Mollie expects a string with the currency's exact number of decimals
@@ -100,7 +129,7 @@ class MolliePaymentGateway implements PaymentInterface
     public function retrievePaymentIntent(string $paymentId, Reservation $reservation): ?object
     {
         try {
-            $payment = Mollie::api()->payments->get($paymentId);
+            $payment = $this->client($reservation)->payments->get($paymentId);
         } catch (ApiException $e) {
             if ($e->getStatusCode() === 404) {
                 return null;
@@ -123,15 +152,17 @@ class MolliePaymentGateway implements PaymentInterface
     }
 
     /**
-     * Map Mollie's payment status onto the Stripe-style vocabulary HandlesDirectGatewayPayment
-     * understands: 'succeeded'/'processing' mean money is already moving (don't remint),
-     * 'canceled' means dead (remint), anything else (i.e. 'open') is resumable.
+     * Map Mollie's payment status onto the Stripe-style vocabulary Resrv reads (Step 13):
+     * 'succeeded'/'processing' mean money was captured or is settling, 'requires_capture' is
+     * an authorization that holds money without collecting it (Resrv voids it instead of
+     * refunding it), 'canceled' means dead (remint), anything else (i.e. 'open') is resumable.
      */
     protected function normalizeIntentStatus(string $status): string
     {
         return match ($status) {
             'paid' => 'succeeded',
-            'pending', 'authorized' => 'processing',
+            'pending' => 'processing',
+            'authorized' => 'requires_capture',
             'canceled', 'expired', 'failed' => 'canceled',
             default => $status, // 'open' — resumable via the hosted checkout URL
         };
@@ -140,13 +171,17 @@ class MolliePaymentGateway implements PaymentInterface
     public function cancelPaymentIntent(string $paymentId, Reservation $reservation): void
     {
         try {
-            $payment = Mollie::api()->payments->get($paymentId);
+            $client = $this->client($reservation);
+            $payment = $client->payments->get($paymentId);
 
-            // Most Mollie payment methods are not cancelable (open payments simply expire);
-            // cancel only when the API says we can. Best-effort: a webhook race is handled
-            // by the stale-intent fallback in verifyPayment().
-            if ($payment->isCancelable) {
-                Mollie::api()->payments->cancel($paymentId);
+            // An authorization is voided by releasing it; the payment then becomes canceled.
+            // Most open Mollie payments are not cancelable at all (they simply expire), so cancel
+            // only when the API says we can. Best-effort: a webhook race is handled by the
+            // stale-intent fallback in verifyPayment().
+            if ($payment->status === 'authorized') {
+                $client->payments->releaseAuthorization($paymentId);
+            } elseif ($payment->isCancelable) {
+                $client->payments->cancel($paymentId);
             }
         } catch (MollieException $e) {
             Log::warning('Failed to cancel Mollie payment: '.$e->getMessage(), [
@@ -158,10 +193,10 @@ class MolliePaymentGateway implements PaymentInterface
 
     public function refund($reservation)
     {
-        $api = Mollie::api();
+        $client = $this->client($reservation);
 
         try {
-            $payment = $api->payments->get($reservation->payment_id);
+            $payment = $client->payments->get($reservation->payment_id);
 
             // A retry after a dropped connection — or an out-of-band dashboard refund —
             // finds the charge already fully refunded: the money is where the caller wants
@@ -178,11 +213,11 @@ class MolliePaymentGateway implements PaymentInterface
             // after Mollie processed the refund, a retry within Mollie's idempotency window
             // replays the original response instead of issuing a second refund. Past that
             // window the full-refund reconciliation above takes over.
-            $api->setIdempotencyKey('resrv-refund-'.$reservation->id.'-'.$reservation->payment_id);
+            $client->setIdempotencyKey('resrv-refund-'.$reservation->id.'-'.$reservation->payment_id);
 
             // Refund the full charge (payment + surcharge) in the currency it was made in —
             // customer self-cancellation promises the customer exactly this amount.
-            return $payment->refund([
+            return $client->payments->refund($payment, [
                 'amount' => [
                     'currency' => $payment->amount->currency,
                     'value' => $payment->amount->value,
@@ -204,7 +239,11 @@ class MolliePaymentGateway implements PaymentInterface
 
         $reservationId = request()->input('id');
 
-        $reservation = is_scalar($reservationId) ? Reservation::find($reservationId) : null;
+        // The id is sequential and comes from the URL: only a signed return URL (or the browser
+        // whose checkout session holds this reservation) may see the reservation or its status.
+        $reservation = is_scalar($reservationId) && $this->returnIsAuthorized((string) $reservationId)
+            ? Reservation::find($reservationId)
+            : null;
 
         // Reservation gone, or its intent was cleared by Checkout::cancelActiveIntent
         // (abandoned checkout, gateway switch) — show the failure message; the webhook
@@ -217,7 +256,7 @@ class MolliePaymentGateway implements PaymentInterface
         }
 
         try {
-            $payment = Mollie::api()->payments->get($reservation->payment_id);
+            $payment = $this->client($reservation)->payments->get($reservation->payment_id);
         } catch (MollieException $e) {
             Log::warning('Mollie redirect back: unable to fetch payment: '.$e->getMessage(), [
                 'payment_id' => $reservation->payment_id,
@@ -237,7 +276,21 @@ class MolliePaymentGateway implements PaymentInterface
             ];
         }
 
-        // The payment is still underway (e.g. bank transfer) — confirmation arrives via webhook.
+        // Pay-by-link page: a customer who left Mollie without paying comes back to a payment
+        // that is still open. Report it as not paid so the page offers Pay again — Pay resumes
+        // this same Mollie payment, so no second chargeable payment is created. A bank transfer
+        // stays open until the money arrives, so it keeps the processing message.
+        if ($payment->status === 'open'
+            && $payment->method !== 'banktransfer'
+            && $reservation->status === ReservationStatus::AWAITING_PAYMENT->value) {
+            return [
+                'status' => false,
+                'reservation' => $reservation->toArray(),
+            ];
+        }
+
+        // The payment is still underway (e.g. bank transfer, or the status hasn't caught up
+        // with a just-completed payment) — confirmation arrives via webhook.
         if (in_array($payment->status, ['open', 'pending', 'authorized'], true)) {
             return [
                 'status' => 'pending',
@@ -276,7 +329,7 @@ class MolliePaymentGateway implements PaymentInterface
         // Mollie webhooks carry no payload or signature — only the payment id. Authenticity
         // comes from fetching the payment from the API; everything below acts on that.
         try {
-            $payment = Mollie::api()->payments->get($paymentId);
+            $payment = $this->client()->payments->get($paymentId);
         } catch (MollieException $e) {
             Log::warning('Mollie webhook: unable to fetch payment: '.$e->getMessage(), [
                 'payment_id' => $paymentId,
@@ -395,9 +448,12 @@ class MolliePaymentGateway implements PaymentInterface
             return response()->json([], 200);
         }
 
+        // 'authorized': the customer approved a hold, but no money is collected yet. These
+        // payments are created with Mollie's default automatic capture, so Mollie captures the
+        // hold itself and calls this webhook again with status 'paid', which confirms above.
         // 'failed' (and anything else): a failed attempt is retryable — leave the reservation
         // PENDING so the customer can try again; ExpireReservations reclaims the hold if abandoned.
-        Log::info('Mollie webhook: payment not paid; leaving reservation PENDING.', [
+        Log::info('Mollie webhook: payment not paid; leaving reservation unconfirmed.', [
             'reservation_id' => $reservation->id,
             'payment_id' => $payment->id,
             'payment_status' => $payment->status,
@@ -453,13 +509,43 @@ class MolliePaymentGateway implements PaymentInterface
 
         // The pay-by-link base already carries ?ref=&hash=, so pick the separator dynamically
         // rather than hard-coding '?'. resrv_gateway lets the redirect-back handler resolve this
-        // gateway even when the session is unavailable on the way back from Mollie.
+        // gateway even when the session is unavailable on the way back from Mollie. sig proves
+        // the return URL was issued for this reservation (see returnIsAuthorized()).
         $separator = str_contains($base, '?') ? '&' : '?';
 
         return $base.$separator.http_build_query([
             'id' => $reservation->id,
             'resrv_gateway' => $this->configKey(),
+            'sig' => $this->returnSignature((string) $reservation->id),
         ]);
+    }
+
+    /**
+     * An HMAC of the reservation id under the app key, scoped to this return URL. It only lets
+     * the bearer see the return page for that reservation, unlike the customer lookup hash,
+     * which also opens the status page (and its cancellation) and must not ride in a URL
+     * Mollie and the browser history keep.
+     */
+    protected function returnSignature(string $reservationId): string
+    {
+        return hash_hmac('sha256', 'resrv-payment-mollie:return:'.$reservationId, (string) config('app.key'));
+    }
+
+    /**
+     * A valid signature, or — for payments created before return URLs were signed — the
+     * browser whose checkout session holds this reservation.
+     */
+    protected function returnIsAuthorized(string $reservationId): bool
+    {
+        $signature = request()->input('sig');
+
+        if (is_string($signature) && hash_equals($this->returnSignature($reservationId), $signature)) {
+            return true;
+        }
+
+        $sessionReservationId = session('resrv_reservation');
+
+        return is_scalar($sessionReservationId) && (string) $sessionReservationId === $reservationId;
     }
 
     protected function paymentDescription(Reservation $reservation): string

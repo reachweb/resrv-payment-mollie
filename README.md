@@ -40,6 +40,13 @@ The config key (`'mollie'`) is stored on each reservation and used to resolve we
 
 The gateway sets the webhook URL (`/resrv/api/webhook/<config-key>`) on every payment automatically, so nothing needs to be configured in the Mollie dashboard. Mollie must be able to reach your site, though — for local development use a public tunnel (e.g. ngrok or Expose), since Mollie rejects payments with an unreachable webhook URL.
 
+## How Mollie payments behave
+
+- **Bank transfer outlives the checkout hold.** A Mollie bank transfer stays open for 12 days or more until the customer's money arrives, but a normal checkout holds the reservation only for `minutes_to_hold`. The reservation therefore expires first, and a transfer that arrives later is not attached to it: admins get an orphaned-payment email and must refund it in Mollie. Disable bank transfer on the Mollie website profile you use with Resrv unless you accept that. On the pay-by-link page for manual reservations, a transfer confirms the booking as long as the booking is still awaiting payment when the money arrives.
+- **Most open payments cannot be cancelled.** When a reservation is cancelled or its payment is replaced, the gateway cancels the Mollie payment only when Mollie allows it (`isCancelable`), which most methods don't. Such a payment stays payable at Mollie until it expires (15 minutes for cards and iDEAL, up to 12 days for bank transfer). Resrv keeps its reference on the reservation, and if the customer still pays it, admins get an orphaned-payment email so they can refund it. Marking a manual reservation as paid while such a payment is open sends the same kind of alert.
+- **Authorized payments confirm once Mollie captures them.** Payments are created with Mollie's default automatic capture. A method that authorizes first (cards with a hold, Klarna, Billie) reaches `authorized`, Mollie captures it, and the booking confirms when the payment becomes `paid`. Methods that only support manual capture (Riverty, Billink) are not supported; don't enable them for this website profile.
+- **Return links are signed.** The link Mollie sends the customer back to carries a signature, so the checkout-complete page shows a reservation only to the customer who paid for it. Payments created by v2.0.0 have unsigned links; those still work from the browser that started the checkout.
+
 ## Documentation
 
 Please refer to the [Resrv documentation](https://resrv.eu/mollie.html) to learn more about how to install and configure this add-on.
