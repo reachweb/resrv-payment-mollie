@@ -6,10 +6,12 @@ use Composer\CaBundle\CaBundle;
 use GuzzleHttp\Client;
 use GuzzleHttp\RequestOptions;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Sleep;
 use Mollie\Api\Exceptions\ApiException;
 use Mollie\Api\Exceptions\MollieException;
 use Mollie\Api\Http\LinearRetryStrategy;
 use Mollie\Api\MollieApiClient;
+use Mollie\Api\Resources\Payment;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
 use Reach\StatamicResrv\Exceptions\RefundFailedException;
@@ -257,6 +259,14 @@ class MolliePaymentGateway implements PaymentInterface
 
         try {
             $payment = $this->client($reservation)->payments->get($reservation->payment_id);
+
+            // A payment the customer has just completed can still read open for a moment, as
+            // when a PayPal customer clicks "Return to Merchant". Mollie advises checking again
+            // after a short interval, so look twice more before reporting it as not paid.
+            for ($recheck = 0; $recheck < 2 && $this->leftUnpaid($payment); $recheck++) {
+                Sleep::for(1500)->milliseconds();
+                $payment = $this->client($reservation)->payments->get($reservation->payment_id);
+            }
         } catch (MollieException $e) {
             Log::warning('Mollie redirect back: unable to fetch payment: '.$e->getMessage(), [
                 'payment_id' => $reservation->payment_id,
@@ -276,21 +286,19 @@ class MolliePaymentGateway implements PaymentInterface
             ];
         }
 
-        // Pay-by-link page: a customer who left Mollie without paying comes back to a payment
-        // that is still open. Report it as not paid so the page offers Pay again — Pay resumes
-        // this same Mollie payment, so no second chargeable payment is created. A bank transfer
-        // stays open until the money arrives, so it keeps the processing message.
-        if ($payment->status === 'open'
-            && $payment->method !== 'banktransfer'
-            && $reservation->status === ReservationStatus::AWAITING_PAYMENT->value) {
+        // Still open: the customer left Mollie without paying. Report it as not paid so they can
+        // try again; on the pay-by-link page, Pay resumes this same payment. The payment stays
+        // payable until Mollie expires it. If it is still paid, verifyPayment() confirms the
+        // reservation while its hold lasts and reports an orphaned payment once it has expired.
+        if ($this->leftUnpaid($payment)) {
             return [
                 'status' => false,
                 'reservation' => $reservation->toArray(),
             ];
         }
 
-        // The payment is still underway (e.g. bank transfer, or the status hasn't caught up
-        // with a just-completed payment) — confirmation arrives via webhook.
+        // The payment is still underway (a payment made at the customer's bank or an ATM, a
+        // pending payment, or an authorization) — confirmation arrives via webhook.
         if (in_array($payment->status, ['open', 'pending', 'authorized'], true)) {
             return [
                 'status' => 'pending',
@@ -302,6 +310,20 @@ class MolliePaymentGateway implements PaymentInterface
             'status' => false,
             'reservation' => $reservation->toArray(),
         ];
+    }
+
+    /**
+     * Whether an open payment means the customer left Mollie without paying. A payment created
+     * without a fixed method stays open after a failed or canceled attempt: Mollie sends the
+     * customer back to its method page and calls no webhook. That holds for every method that
+     * completes while the customer is at Mollie (cards, iDEAL, PayPal…) and for a payment with
+     * no method chosen yet. Bank transfer, Multibanco and Pay by Bank complete at the
+     * customer's bank or an ATM after they leave Mollie, so their payments can still be open.
+     */
+    protected function leftUnpaid(Payment $payment): bool
+    {
+        return $payment->status === 'open'
+            && ! in_array($payment->method, ['banktransfer', 'multibanco', 'paybybank'], true);
     }
 
     public function handlePaymentPending(): bool|array
@@ -509,13 +531,15 @@ class MolliePaymentGateway implements PaymentInterface
 
         // The pay-by-link base already carries ?ref=&hash=, so pick the separator dynamically
         // rather than hard-coding '?'. resrv_gateway lets the redirect-back handler resolve this
-        // gateway even when the session is unavailable on the way back from Mollie. sig proves
-        // the return URL was issued for this reservation (see returnIsAuthorized()).
+        // gateway even when the session is unavailable on the way back from Mollie; Resrv
+        // already adds it to the pay-by-link base. sig proves the return URL was issued for
+        // this reservation (see returnIsAuthorized()).
         $separator = str_contains($base, '?') ? '&' : '?';
 
         return $base.$separator.http_build_query([
             'id' => $reservation->id,
-            'resrv_gateway' => $this->configKey(),
+            // http_build_query() drops a null value.
+            'resrv_gateway' => str_contains($base, 'resrv_gateway=') ? null : $this->configKey(),
             'sig' => $this->returnSignature((string) $reservation->id),
         ]);
     }

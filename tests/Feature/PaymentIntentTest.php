@@ -66,6 +66,7 @@ class PaymentIntentTest extends TestCase
         $this->assertSame($reservation->reference, $params['ref']);
         $this->assertSame($reservation->customerLookupHash(), $params['hash']);
         $this->assertSame('mollie', $params['resrv_gateway']);
+        $this->assertSame(1, substr_count($body['redirectUrl'], 'resrv_gateway='), 'Resrv already put it on the base.');
         $this->assertSame('55.00', $body['amount']['value']);
         $this->assertSame('tr_new', $reservation->fresh()->payment_id);
     }

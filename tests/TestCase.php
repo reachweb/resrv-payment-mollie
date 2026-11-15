@@ -5,6 +5,7 @@ namespace Reach\ResrvPaymentMollie\Tests;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Sleep;
 use Livewire\Livewire;
 use Livewire\LivewireServiceProvider;
 use MarcoRieser\Livewire\ServiceProvider as StatamicLivewireServiceProvider;
@@ -43,6 +44,8 @@ abstract class TestCase extends AddonTestCase
 
         $this->instance(Outpost::class, Mockery::mock(Outpost::class)->shouldIgnoreMissing());
         $this->withoutExceptionHandling();
+        // The return page pauses before checking an open payment again; tests don't wait.
+        Sleep::fake();
         Rate::resetEntryCollectionCache();
 
         Site::setSites(['en' => ['name' => 'English', 'url' => 'http://localhost/', 'locale' => 'en_US', 'lang' => 'en']]);
