@@ -3,6 +3,7 @@
 namespace Reach\ResrvPaymentMollie\Tests\Feature;
 
 use Illuminate\Http\Request;
+use Illuminate\Support\Sleep;
 use Livewire\Livewire;
 use Reach\ResrvPaymentMollie\Tests\Support\FakeMollieApi;
 use Reach\ResrvPaymentMollie\Tests\TestCase;
@@ -54,14 +55,88 @@ class RedirectBackTest extends TestCase
         $this->assertSame($reservation->reference, $result['reservation']['reference']);
     }
 
-    public function test_the_checkout_complete_page_shows_an_open_payment_as_pending()
+    public function test_the_checkout_complete_page_reports_an_open_payment_as_not_paid_after_a_failed_attempt()
     {
-        // Mollie's guidance for an open payment on return is a processing screen: the customer
-        // may have chosen bank transfer, and the webhook settles it either way.
+        // After a failed card attempt Mollie shows its method page again and the payment stays
+        // open with no webhook. A customer who comes back from there has not paid, whichever
+        // method they tried (or none yet), and must be told to try again.
         $url = $this->returnUrlFor($this->makeReservation());
-        $this->mollie->on('GET', '/v2/payments/tr_test1', [200, FakeMollieApi::payment()]);
 
-        $this->assertSame('pending', $this->checkoutCompleteResult($url)['status']);
+        foreach (['creditcard', 'ideal', null] as $method) {
+            $this->mollie->on('GET', '/v2/payments/tr_test1', [200, FakeMollieApi::payment(['method' => $method])]);
+
+            $this->assertFalse($this->checkoutCompleteResult($url)['status'], 'Method ['.($method ?? 'none').']');
+        }
+    }
+
+    public function test_the_checkout_complete_page_waits_for_an_open_payment_only_on_the_first_return()
+    {
+        // Two more looks, 1.5 s apart, before reporting not paid. A refresh, or anyone repeating
+        // the signed request, reads once: the page must not hold a worker for seconds each time.
+        $url = $this->returnUrlFor($this->makeReservation());
+        $this->mollie->on('GET', '/v2/payments/tr_test1', [200, FakeMollieApi::payment(['method' => 'creditcard'])]);
+
+        $this->assertFalse($this->checkoutCompleteResult($url)['status']);
+        $this->assertCount(3, $this->mollie->requests('GET', '/v2/payments/tr_test1'));
+        Sleep::assertSequence([Sleep::for(1500)->milliseconds(), Sleep::for(1500)->milliseconds()]);
+
+        $this->assertFalse($this->checkoutCompleteResult($url)['status']);
+        $this->assertCount(4, $this->mollie->requests('GET', '/v2/payments/tr_test1'));
+        Sleep::assertSleptTimes(2);
+    }
+
+    public function test_the_checkout_complete_page_reports_a_failed_second_look_as_not_paid()
+    {
+        $url = $this->returnUrlFor($this->makeReservation());
+        $reads = 0;
+        $this->mollie->on('GET', '/v2/payments/tr_test1', function () use (&$reads) {
+            return ++$reads === 1 ? [200, FakeMollieApi::payment(['method' => 'creditcard'])] : FakeMollieApi::error(503, 'Service unavailable');
+        });
+
+        $this->assertFalse($this->checkoutCompleteResult($url)['status']);
+    }
+
+    public function test_the_checkout_complete_page_checks_an_open_payment_again_before_reporting_it_unpaid()
+    {
+        // A PayPal customer who clicks "Return to Merchant" can arrive while the payment still
+        // reads open. A second look a moment later finds it paid.
+        $url = $this->returnUrlFor($this->makeReservation());
+        $reads = 0;
+        $this->mollie->on('GET', '/v2/payments/tr_test1', function () use (&$reads) {
+            return [200, ++$reads === 1 ? FakeMollieApi::payment(['method' => 'paypal']) : FakeMollieApi::paid(['method' => 'paypal'])];
+        });
+
+        $this->assertTrue($this->checkoutCompleteResult($url)['status']);
+        Sleep::assertSequence([Sleep::for(1500)->milliseconds()]);
+    }
+
+    public function test_the_checkout_complete_page_shows_an_open_bank_transfer_as_pending()
+    {
+        // Bank transfer, Multibanco and Pay by Bank complete at the customer's bank or an ATM
+        // after they leave Mollie: the payment can stay open meanwhile, and the webhook confirms
+        // the reservation once the money arrives. There is nothing to wait for on the return.
+        $url = $this->returnUrlFor($this->makeReservation());
+
+        foreach (['banktransfer', 'multibanco', 'paybybank'] as $method) {
+            $this->mollie->on('GET', '/v2/payments/tr_test1', [200, FakeMollieApi::payment(['method' => $method])]);
+
+            $this->assertSame('pending', $this->checkoutCompleteResult($url)['status'], "Method [{$method}]");
+        }
+
+        Sleep::assertNeverSlept();
+    }
+
+    public function test_the_checkout_complete_page_shows_a_pending_or_authorized_payment_as_pending()
+    {
+        $url = $this->returnUrlFor($this->makeReservation());
+
+        foreach (['pending', 'authorized'] as $status) {
+            $this->mollie->on('GET', '/v2/payments/tr_test1', [200, FakeMollieApi::payment(['status' => $status, 'method' => 'creditcard', '_links' => ['checkout' => null]])]);
+
+            $this->assertSame('pending', $this->checkoutCompleteResult($url)['status'], "Status [{$status}]");
+        }
+
+        Sleep::assertNeverSlept();
     }
 
     public function test_the_checkout_complete_page_shows_a_canceled_payment_as_failed()
