@@ -5,6 +5,7 @@ namespace Reach\ResrvPaymentMollie\Http\Payment;
 use Composer\CaBundle\CaBundle;
 use GuzzleHttp\Client;
 use GuzzleHttp\RequestOptions;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Sleep;
 use Mollie\Api\Exceptions\ApiException;
@@ -258,14 +259,19 @@ class MolliePaymentGateway implements PaymentInterface
         }
 
         try {
-            $payment = $this->client($reservation)->payments->get($reservation->payment_id);
+            $client = $this->client($reservation);
+            $payment = $client->payments->get($reservation->payment_id);
 
             // A payment the customer has just completed can still read open for a moment, as
             // when a PayPal customer clicks "Return to Merchant". Mollie advises checking again
-            // after a short interval, so look twice more before reporting it as not paid.
-            for ($recheck = 0; $recheck < 2 && $this->leftUnpaid($payment); $recheck++) {
-                Sleep::for(1500)->milliseconds();
-                $payment = $this->client($reservation)->payments->get($reservation->payment_id);
+            // after a short interval, so look twice more before reporting it as not paid. Only
+            // the first return for a payment waits: a refresh, or anyone repeating the request,
+            // must not hold a worker for seconds every time.
+            if ($this->leftUnpaid($payment) && Cache::add('resrv-mollie-return-recheck:'.$payment->id, true, now()->addMinutes(15))) {
+                for ($recheck = 0; $recheck < 2 && $this->leftUnpaid($payment); $recheck++) {
+                    Sleep::for(1500)->milliseconds();
+                    $payment = $client->payments->get($reservation->payment_id);
+                }
             }
         } catch (MollieException $e) {
             Log::warning('Mollie redirect back: unable to fetch payment: '.$e->getMessage(), [

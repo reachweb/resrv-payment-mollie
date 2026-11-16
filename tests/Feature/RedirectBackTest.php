@@ -69,6 +69,33 @@ class RedirectBackTest extends TestCase
         }
     }
 
+    public function test_the_checkout_complete_page_waits_for_an_open_payment_only_on_the_first_return()
+    {
+        // Two more looks, 1.5 s apart, before reporting not paid. A refresh, or anyone repeating
+        // the signed request, reads once: the page must not hold a worker for seconds each time.
+        $url = $this->returnUrlFor($this->makeReservation());
+        $this->mollie->on('GET', '/v2/payments/tr_test1', [200, FakeMollieApi::payment(['method' => 'creditcard'])]);
+
+        $this->assertFalse($this->checkoutCompleteResult($url)['status']);
+        $this->assertCount(3, $this->mollie->requests('GET', '/v2/payments/tr_test1'));
+        Sleep::assertSequence([Sleep::for(1500)->milliseconds(), Sleep::for(1500)->milliseconds()]);
+
+        $this->assertFalse($this->checkoutCompleteResult($url)['status']);
+        $this->assertCount(4, $this->mollie->requests('GET', '/v2/payments/tr_test1'));
+        Sleep::assertSleptTimes(2);
+    }
+
+    public function test_the_checkout_complete_page_reports_a_failed_second_look_as_not_paid()
+    {
+        $url = $this->returnUrlFor($this->makeReservation());
+        $reads = 0;
+        $this->mollie->on('GET', '/v2/payments/tr_test1', function () use (&$reads) {
+            return ++$reads === 1 ? [200, FakeMollieApi::payment(['method' => 'creditcard'])] : FakeMollieApi::error(503, 'Service unavailable');
+        });
+
+        $this->assertFalse($this->checkoutCompleteResult($url)['status']);
+    }
+
     public function test_the_checkout_complete_page_checks_an_open_payment_again_before_reporting_it_unpaid()
     {
         // A PayPal customer who clicks "Return to Merchant" can arrive while the payment still
@@ -80,7 +107,7 @@ class RedirectBackTest extends TestCase
         });
 
         $this->assertTrue($this->checkoutCompleteResult($url)['status']);
-        Sleep::assertSleptTimes(1);
+        Sleep::assertSequence([Sleep::for(1500)->milliseconds()]);
     }
 
     public function test_the_checkout_complete_page_shows_an_open_bank_transfer_as_pending()
@@ -108,6 +135,8 @@ class RedirectBackTest extends TestCase
 
             $this->assertSame('pending', $this->checkoutCompleteResult($url)['status'], "Status [{$status}]");
         }
+
+        Sleep::assertNeverSlept();
     }
 
     public function test_the_checkout_complete_page_shows_a_canceled_payment_as_failed()
