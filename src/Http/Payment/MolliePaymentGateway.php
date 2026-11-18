@@ -403,27 +403,28 @@ class MolliePaymentGateway implements PaymentInterface
             return response()->json([], 200);
         }
 
+        // Stale intent: the customer moved on (back button, gateway switch) before this payment
+        // completed. Confirming would attach a charge to an amount or gateway the reservation is
+        // no longer tied to — notify admins for manual refund instead. A booking another payment
+        // has confirmed since makes this one a second charge, so it alerts too.
+        if ($payment->isPaid() && $isStaleIntent) {
+            Log::warning('Mollie payment succeeded after being abandoned by the customer — manual reconciliation may be required.', [
+                'reservation_id' => $reservation->id,
+                'payment_id' => $payment->id,
+                'current_payment_id' => $reservation->payment_id,
+                'current_payment_gateway' => $reservation->payment_gateway,
+            ]);
+
+            OrphanedPaymentNotification::dispatchFor($reservation, $payment->id);
+
+            return response()->json([], 200);
+        }
+
         if ($reservation->status === ReservationStatus::CONFIRMED->value) {
             return response()->json([], 200);
         }
 
         if ($payment->isPaid()) {
-            // Stale intent: the customer moved on (back button, gateway switch) before this
-            // payment completed. Confirming would attach a charge to an amount or gateway the
-            // reservation is no longer tied to — notify admins for manual refund instead.
-            if ($isStaleIntent) {
-                Log::warning('Mollie payment succeeded after being abandoned by the customer — manual reconciliation may be required.', [
-                    'reservation_id' => $reservation->id,
-                    'payment_id' => $payment->id,
-                    'current_payment_id' => $reservation->payment_id,
-                    'current_payment_gateway' => $reservation->payment_gateway,
-                ]);
-
-                OrphanedPaymentNotification::dispatchFor($reservation, $payment->id);
-
-                return response()->json([], 200);
-            }
-
             // Terminal reservation (expired/refunded/partner): the charge can't attach to a
             // live booking — notify and stop.
             if (OrphanedPaymentNotification::notifyIfOrphaned($reservation, $payment->id)) {

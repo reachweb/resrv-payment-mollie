@@ -2,11 +2,14 @@
 
 namespace Reach\ResrvPaymentMollie\Tests\Feature;
 
+use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Mail;
 use Reach\ResrvPaymentMollie\Tests\Support\FakeMollieApi;
 use Reach\ResrvPaymentMollie\Tests\TestCase;
 use Reach\StatamicResrv\Enums\ReservationStatus;
 use Reach\StatamicResrv\Events\ReservationConfirmed;
+use Reach\StatamicResrv\Mail\OrphanedPaymentNotification;
 
 class WebhookTest extends TestCase
 {
@@ -121,6 +124,27 @@ class WebhookTest extends TestCase
 
         $this->assertSame(ReservationStatus::PENDING->value, $reservation->fresh()->status);
         Event::assertNotDispatched(ReservationConfirmed::class);
+    }
+
+    public function test_a_payment_the_customer_abandoned_alerts_admins_when_paid_after_the_booking_was_confirmed_another_way()
+    {
+        // The customer left tr_old open (most methods can't be cancelled) and confirmed with
+        // tr_current, so tr_old paying later is a second charge. A redelivery of tr_current is not.
+        Mail::fake();
+        Config::set('resrv-config.admin_email', 'admin@example.com');
+
+        $reservation = $this->makeReservation(['status' => ReservationStatus::CONFIRMED->value, 'payment_id' => 'tr_current']);
+        $metadata = ['metadata' => ['reservation_id' => $reservation->id]];
+        $this->mollie->on('GET', '/v2/payments/tr_current', [200, FakeMollieApi::paid(['id' => 'tr_current'] + $metadata)]);
+        $this->mollie->on('GET', '/v2/payments/tr_old', [200, FakeMollieApi::paid(['id' => 'tr_old'] + $metadata)]);
+
+        $this->webhook('tr_current')->assertOk();
+        $this->webhook('tr_old')->assertOk();
+
+        $this->assertSame([ReservationStatus::CONFIRMED->value, 'tr_current'], [$reservation->fresh()->status, $reservation->fresh()->payment_id]);
+        Event::assertNotDispatched(ReservationConfirmed::class);
+        Mail::assertSent(OrphanedPaymentNotification::class, 1);
+        Mail::assertSent(OrphanedPaymentNotification::class, fn ($mail) => $mail->paymentIntentId === 'tr_old' && $mail->hasTo('admin@example.com'));
     }
 
     public function test_a_canceled_payment_the_customer_abandoned_does_not_expire_the_reservation()
